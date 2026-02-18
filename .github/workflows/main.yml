@@ -1,4 +1,4 @@
-name: 解析 YouTube 直播列表并生成 M3U 播放列表[span_3](end_span)
+name: 解析 YouTube 直播列表并生成 M3U 播放列表
 
 on:
   schedule:
