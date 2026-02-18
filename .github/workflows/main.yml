@@ -1,0 +1,104 @@
+name: 解析 YouTube 直播列表並生成 M3U 播放列表
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # 每小時運行一次
+  workflow_dispatch:       # 支持手動觸發
+
+jobs:
+  generate_m3u:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 檢出代碼
+        uses: actions/checkout@v4
+
+      - name: 安裝 yt-dlp
+        run: |
+          python -m pip install --upgrade pip
+          pip install yt-dlp
+
+      - name: 讀取 URL 列表並生成 M3U 文件
+        id: generate
+        run: |
+          INPUT_FILE="ytlist.txt"
+          OUTPUT_FILE="live.m3u"
+
+          if [ ! -f "$INPUT_FILE" ]; then
+            echo "錯誤：$INPUT_FILE 不存在！"
+            exit 1
+          fi
+
+          echo "#EXTM3U" > "$OUTPUT_FILE"
+
+          # 逐行處理，支持 "名稱,鏈接" 或僅 "鏈接" 格式
+          while IFS= read -r line || [ -n "$line" ]; do
+            # 跳過空行和註釋行
+            if [ -z "$line" ] || [[ "$line" == \#* ]]; then
+              continue
+            fi
+
+            # 解析行內容：如果包含逗號，則前半為標題，後半為URL
+            if [[ "$line" == *","* ]]; then
+              url=$(echo "$line" | cut -d',' -f2- | xargs)
+              file_title=$(echo "$line" | cut -d',' -f1 | xargs)
+            else
+              url=$(echo "$line" | xargs)
+              file_title=""
+            fi
+
+            echo "正在處理: $url"
+
+            # === 修改點：使用瀏覽器模擬參數獲取標題 ===
+            title=$(yt-dlp \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              --add-header "Accept-Language: zh-TW,zh;q=0.9,en;q=0.8" \
+              --add-header "Referer: https://www.youtube.com/" \
+              --live-from-start \
+              --skip-download \
+              --get-title \
+              --no-warnings \
+              "$url" 2>/dev/null | head -n 1)
+
+            if [ -z "$title" ]; then
+              title="${file_title:-Unknown Channel}"
+            fi
+
+            # === 修改點：使用瀏覽器模擬參數獲取流地址 ===
+            stream_url=$(yt-dlp \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              --add-header "Accept-Language: zh-TW,zh;q=0.9,en;q=0.8" \
+              --add-header "Referer: https://www.youtube.com/" \
+              --live-from-start \
+              --skip-download \
+              --get-url \
+              --no-warnings \
+              "$url" 2>/dev/null | head -n 1)
+
+            if [ -z "$stream_url" ]; then
+              echo "警告：無法獲取 $url 的流地址，跳過"
+              echo "# 無法獲取: $url" >> "$OUTPUT_FILE"
+              continue
+            fi
+
+            # 寫入 M3U 條目
+            echo "#EXTINF:-1,$title" >> "$OUTPUT_FILE"
+            echo "$stream_url" >> "$OUTPUT_FILE"
+            echo "已添加: $title"
+          done < "$INPUT_FILE"
+
+          echo "生成完成：$OUTPUT_FILE"
+          echo "OUTPUT_FILE=$OUTPUT_FILE" >> $GITHUB_ENV
+
+      - name: 上傳生成的 M3U 文件作為工件
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-m3u-playlist
+          path: ${{ env.OUTPUT_FILE }}
+
+      - name: 將 M3U 文件提交到倉庫
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add ${{ env.OUTPUT_FILE }}
+          git diff --quiet && git diff --staged --quiet || git commit -m "更新直播流播放列表 [skip ci]"
+          git push
