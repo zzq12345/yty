@@ -1,0 +1,113 @@
+name: 解析 YouTube 直播列表并生成 M3U 播放列表 (Cookie认证)
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # 每小时运行一次
+  workflow_dispatch:       # 支持手动触发
+
+jobs:
+  generate_m3u:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 yt-dlp
+        run: |
+          python -m pip install --upgrade pip
+          pip install yt-dlp
+
+      - name: 从 Secrets 创建 Cookies 文件
+        run: echo "${{ secrets.YT_COOKIES }}" > cookies.txt
+
+      - name: 读取 URL 列表并生成 M3U 文件
+        id: generate
+        run: |
+          INPUT_FILE="ytlist.txt"
+          OUTPUT_FILE="live.m3u"
+
+          if [ ! -f "$INPUT_FILE" ]; then
+            echo "错误：$INPUT_FILE 不存在！"
+            exit 1
+          fi
+
+          echo "#EXTM3U" > "$OUTPUT_FILE"
+
+          # 逐行处理，支持 "名称,链接" 或仅 "链接" 格式
+          while IFS= read -r line || [ -n "$line" ]; do
+            # 跳过空行和注释行
+            if [ -z "$line" ] || [[ "$line" == \#* ]]; then
+              continue
+            fi
+
+            # 解析行内容：如果包含逗号，则前半为标题，后半为URL
+            if [[ "$line" == *","* ]]; then
+              url=$(echo "$line" | cut -d',' -f2- | xargs)
+              file_title=$(echo "$line" | cut -d',' -f1 | xargs)
+            else
+              url=$(echo "$line" | xargs)
+              file_title=""
+            fi
+
+            echo "正在处理: $url"
+
+            # 使用 Cookies 获取直播流标题
+            title=$(yt-dlp \
+              --cookies cookies.txt \
+              --skip-download \
+              --get-title \
+              --no-warnings \
+              "$url" 2>/dev/null | head -n 1)
+
+            if [ -z "$title" ]; then
+              title="${file_title:-Unknown Channel}"
+            fi
+
+            # 使用 Cookies 获取直播流 M3U8 地址
+            stream_url=$(yt-dlp \
+              --cookies cookies.txt \
+              --skip-download \
+              --get-url \
+              --no-warnings \
+              "$url" 2>/dev/null | head -n 1)
+
+            # For debugging: Log formats to see available streams
+            yt-dlp --cookies cookies.txt --skip-download --list-formats --no-warnings "$url" >> debug.log 2>&1
+
+            # If stream_url empty, try fallback without cookies (for public streams)
+            if [ -z "$stream_url" ]; then
+              stream_url=$(yt-dlp \
+                --skip-download \
+                --get-url \
+                --no-warnings \
+                "$url" 2>/dev/null | head -n 1)
+              if [ -z "$stream_url" ]; then
+                echo "警告：无法获取 $url 的流地址，跳过"
+                echo "# 无法获取: $url" >> "$OUTPUT_FILE"
+                continue
+              fi
+            fi
+
+            # 写入 M3U 条目
+            echo "#EXTINF:-1,$title" >> "$OUTPUT_FILE"
+            echo "$stream_url" >> "$OUTPUT_FILE"
+            echo "已添加: $title"
+          done < "$INPUT_FILE"
+
+          echo "生成完成：$OUTPUT_FILE"
+          echo "OUTPUT_FILE=$OUTPUT_FILE" >> $GITHUB_ENV
+
+      - name: 上传生成的 M3U 文件作为工件
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-m3u-playlist
+          path: ${{ env.OUTPUT_FILE }}
+
+      - name: 将 M3U 文件提交到仓库
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add ${{ env.OUTPUT_FILE }}
+          # 仅当文件有变化时才提交
+          git diff --quiet && git diff --staged --quiet || git commit -m "更新直播流播放列表 [skip ci]"
+          git push
